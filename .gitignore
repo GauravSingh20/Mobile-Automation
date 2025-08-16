@@ -1,0 +1,15 @@
+#Node Modules
+node_modules
+
+# Logs
+logs
+
+#reports
+allure-report
+allure-results
+
+#.env
+.env
+
+# Configuration files
+wdio.ipad.conf.ts

@@ -1,0 +1,46 @@
+name: Android Test Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: 'URL to download the Android APK'
+        required: true
+        type: string
+
+jobs:
+  android-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download APK
+        run: |
+          curl -L "${{ github.event.inputs.app_url }}" -o app.apk
+
+      - name: Upload APK to BrowserStack
+        id: upload_app
+        run: |
+          response=$(curl -u "$BROWSERSTACK_USERNAME:$BROWSERSTACK_ACCESS_KEY" -X POST https://api-cloud.browserstack.com/app-automate/upload -F "file=@app.apk")
+          echo "$response"
+          app_url=$(echo $response | jq -r .app_url)
+          echo "app_url=$app_url" >> $GITHUB_OUTPUT
+        env:
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Android tests
+        run: npx wdio run ./wdio.android.conf.ts
+        env:
+          BROWSERSTACK_APP_URL: ${{ steps.upload_app.outputs.app_url }}
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
