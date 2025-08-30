@@ -1,0 +1,429 @@
+name: Android Emulator Smoke Tests
+
+on:
+  # schedule:
+  #   - cron: '0 3 * * *'
+  workflow_dispatch:
+  # push:
+  #   branches: [ main ]
+  # pull_request:
+  #   branches: [ main ]
+
+jobs:
+  android-emulator-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    strategy:
+      matrix:
+        api-level: [29]
+        target: [google_apis]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Python and gdown
+        run: |
+          sudo apt-get update
+          sudo apt-get install python3-pip jq -y
+          pip install gdown
+
+      - name: Create app directory
+        run: mkdir -p app
+
+      - name: Download APK from Google Drive folder
+        run: |
+          # Google Drive folder link containing InvoiceSimple.apk
+          GDRIVE_FOLDER_URL="https://drive.google.com/file/d/1XQWKi8p56IqCkDYy1kk2Q2qEd2D2_uB8/view?usp=drive_link"
+          FOLDER_ID=$(echo $GDRIVE_FOLDER_URL | sed -n 's/.*\/folders\/\([^?]*\).*/\1/p')
+          echo "Folder ID: $FOLDER_ID"
+          
+          # Download all files from the folder
+          gdown --folder https://drive.google.com/drive/folders/$FOLDER_ID --output temp_folder/
+          
+          # Find and move the InvoiceSimple.apk file
+          if find temp_folder -name "InvoiceSimple.apk" -type f | head -1 | xargs -I {} mv {} app/InvoiceSimple.apk; then
+            echo "APK found and moved successfully"
+            ls -la app/InvoiceSimple.apk
+            # Clean up temporary folder
+            rm -rf temp_folder
+          else
+            echo "InvoiceSimple.apk not found in the folder"
+            echo "Files found in folder:"
+            find temp_folder -type f -name "*.apk" 2>/dev/null || echo "No APK files found"
+            rm -rf temp_folder
+            exit 1
+          fi
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: AVD cache
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ matrix.api-level }}-${{ matrix.target }}
+
+      - name: Create AVD and generate snapshot for caching
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: ${{ matrix.target }}
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
+
+      - name: Install Appium and drivers
+        run: |
+          npm install -g appium@latest
+          
+          # Update existing drivers instead of installing
+          echo "Updating uiautomator2 driver..."
+          appium driver update uiautomator2 || {
+            echo "Update failed, trying to install..."
+            appium driver install uiautomator2 || echo "Driver install also failed, may already be installed"
+          }
+          
+          # Skip wait plugin for now as it may not be essential
+          echo "Skipping wait plugin installation"
+
+      - name: Verify Appium installation
+        run: |
+          appium --version
+          appium driver list
+
+      - name: Start Appium server
+        run: |
+          appium --address 127.0.0.1 --port 4723 --log-level info &
+          echo $! > appium.pid
+          
+          # Wait for Appium to start
+          echo "Waiting for Appium server to start..."
+          timeout 30 bash -c 'until curl -s http://127.0.0.1:4723/status > /dev/null; do sleep 1; done'
+          
+          if curl -s http://127.0.0.1:4723/status > /dev/null; then
+            echo "Appium server started successfully"
+          else
+            echo "Failed to start Appium server"
+            exit 1
+          fi
+
+      - name: Run tests in Android Emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: ${{ matrix.target }}
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            echo "Emulator started, waiting for boot completion..."
+            adb wait-for-device
+            adb shell input keyevent 82
+            
+            # Wait for emulator to be fully ready
+            echo "Waiting for emulator to be fully ready..."
+            timeout 300 bash -c 'while [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" != "1" ]; do echo "Still waiting for boot completion..."; sleep 10; done'
+            
+            # Verify emulator is ready
+            adb shell getprop sys.boot_completed
+            adb devices
+            
+            # Install APK
+            echo "Installing APK..."
+            adb install -r app/InvoiceSimple.apk
+            
+            # Verify APK installation
+            adb shell pm list packages | grep -i invoice || echo "APK not found in installed packages"
+            
+            # Detect actual API level of the emulator
+            ACTUAL_API_LEVEL=$(adb shell getprop ro.build.version.sdk)
+            echo "Detected emulator API level: $ACTUAL_API_LEVEL"
+            
+            # Set environment variables for tests
+            export ANDROID_DEVICE_NAME="emulator-5554"
+            export ANDROID_PLATFORM_VERSION="$ACTUAL_API_LEVEL"
+            export ANDROID_UDID="emulator-5554"
+            
+            # Run tests
+            echo "Starting WebDriverIO tests on emulator..."
+            npx wdio wdio.emulator.ci.conf.ts | tee wdio-output.log
+
+      - name: Stop Appium server
+        if: always()
+        run: |
+          if [ -f appium.pid ]; then
+            kill $(cat appium.pid) || true
+            rm appium.pid
+          fi
+
+      - name: Install Allure CLI
+        if: always()
+        run: |
+          npm install -g allure-commandline
+          allure --version
+
+      - name: Generate Allure Report
+        if: always()
+        run: |
+          if [ -d "allure-results" ] && [ "$(ls -A allure-results)" ]; then
+            allure generate --clean --single-file allure-results -o allure-report
+          else
+            echo "No allure-results found or directory is empty"
+            mkdir -p allure-report
+            echo "<html><body><h1>No test results found</h1></body></html>" > allure-report/index.html
+          fi
+
+      - name: Upload Allure Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report-android-api-${{ matrix.api-level }}
+          path: allure-report/
+          retention-days: 7
+
+      - name: Upload Screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-android-api-${{ matrix.api-level }}
+          path: screenshots/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-android-api-${{ matrix.api-level }}
+          path: |
+            wdio-output.log
+            logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Generate Test Summary
+        id: test_summary
+        if: always()
+        run: |
+          if [ -f "wdio-output.log" ]; then
+            PASSED=$(grep -oP '\d+(?= passed)' wdio-output.log | awk '{sum += $1} END {print sum+0}')
+            FAILED=$(grep -oP '\d+(?= failed)' wdio-output.log | awk '{sum += $1} END {print sum+0}')
+            SKIPPED=$(grep -oP '\d+(?= skipped)' wdio-output.log | awk '{sum += $1} END {print sum+0}')
+            TOTAL=$((PASSED + FAILED + SKIPPED))
+            
+            echo "PASSED=$PASSED" >> $GITHUB_ENV
+            echo "FAILED=$FAILED" >> $GITHUB_ENV
+            echo "SKIPPED=$SKIPPED" >> $GITHUB_ENV
+            echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+            
+            # Calculate failure percentage for better status representation
+            if [ $TOTAL -gt 0 ]; then
+              FAILURE_PERCENTAGE=$((FAILED * 100 / TOTAL))
+            else
+              FAILURE_PERCENTAGE=0
+            fi
+            
+            echo "FAILURE_PERCENTAGE=$FAILURE_PERCENTAGE" >> $GITHUB_ENV
+            
+            # Determine status based on failure ratio
+            if [ $FAILED -eq 0 ]; then
+              SUMMARY="✅ All Tests Passed: $TOTAL total, $PASSED passed, $FAILED failed, $SKIPPED skipped"
+              echo "TEST_STATUS=PASSED" >> $GITHUB_ENV
+            elif [ $FAILURE_PERCENTAGE -le 25 ]; then
+              SUMMARY="⚠️ Mostly Passed (${FAILURE_PERCENTAGE}% failed): $TOTAL total, $PASSED passed, $FAILED failed, $SKIPPED skipped"
+              echo "TEST_STATUS=MOSTLY_PASSED" >> $GITHUB_ENV
+            elif [ $FAILURE_PERCENTAGE -le 45 ]; then
+              SUMMARY="🔶 Some Issues (${FAILURE_PERCENTAGE}% failed): $TOTAL total, $PASSED passed, $FAILED failed, $SKIPPED skipped"
+              echo "TEST_STATUS=SOME_FAILED" >> $GITHUB_ENV
+            else
+              SUMMARY="❌ Many Tests Failed (${FAILURE_PERCENTAGE}% failed): $TOTAL total, $PASSED passed, $FAILED failed, $SKIPPED skipped"
+              echo "TEST_STATUS=MANY_FAILED" >> $GITHUB_ENV
+            fi
+          else
+            SUMMARY="⚠️ No test results found - Check logs for issues"
+            echo "TEST_STATUS=ERROR" >> $GITHUB_ENV
+          fi
+          
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+          echo "Test Summary: $SUMMARY"
+
+      # - name: Send Slack Notification
+      #   if: always() && env.SLACK_WEBHOOK_URL != ''
+      #   env:
+      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      #   run: |
+      #     # Determine status, color and emoji based on nuanced test results
+      #     if [ "${{ env.TEST_STATUS }}" == "PASSED" ]; then
+      #       COLOR="#36a64f"
+      #       EMOJI="✅"
+      #       STATUS_TEXT="All Tests Passed"
+      #     elif [ "${{ env.TEST_STATUS }}" == "MOSTLY_PASSED" ]; then
+      #       COLOR="#ffaa00"
+      #       EMOJI="⚠️"
+      #       STATUS_TEXT="Mostly Passed (${{ env.FAILURE_PERCENTAGE }}% failed)"
+      #     elif [ "${{ env.TEST_STATUS }}" == "SOME_FAILED" ]; then
+      #       COLOR="#ff6600"
+      #       EMOJI="🔶"
+      #       STATUS_TEXT="Some Issues (${{ env.FAILURE_PERCENTAGE }}% failed)"
+      #     elif [ "${{ env.TEST_STATUS }}" == "MANY_FAILED" ]; then
+      #       COLOR="#ff0000"
+      #       EMOJI="❌"
+      #       STATUS_TEXT="Many Tests Failed (${{ env.FAILURE_PERCENTAGE }}% failed)"
+      #     else
+      #       COLOR="#ffaa00"
+      #       EMOJI="⚠️"
+      #       STATUS_TEXT="No Results Found"
+      #     fi
+          
+      #     RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      #     ARTIFACT_URL="${RUN_URL}#artifacts"
+          
+      #     # Get commit message
+      #     COMMIT_MSG="${{ github.event.head_commit.message }}"
+      #     if [ -z "$COMMIT_MSG" ]; then
+      #       COMMIT_MSG="No commit message"
+      #     fi
+          
+      #     # Truncate commit message if too long
+      #     COMMIT_MSG=$(echo "$COMMIT_MSG" | head -c 100)
+          
+      #     curl -X POST -H 'Content-type: application/json' \
+      #     --data '{
+      #       "attachments": [
+      #         {
+      #           "fallback": "'"$EMOJI"' Android Emulator Tests '"$STATUS_TEXT"' on API '"${{ matrix.api-level }}"'",
+      #           "color": "'"$COLOR"'",
+      #           "title": "'"$EMOJI"' Android Emulator Tests - '"$STATUS_TEXT"'",
+      #           "fields": [
+      #             {
+      #               "title": "API Level",
+      #               "value": "'"${{ matrix.api-level }}"'",
+      #               "short": true
+      #             },
+      #             {
+      #               "title": "Branch",
+      #               "value": "`'"${{ github.ref_name }}"'`",
+      #               "short": true
+      #             },
+      #             {
+      #               "title": "Actor",
+      #               "value": "'"${{ github.actor }}"'",
+      #               "short": true
+      #             },
+      #             {
+      #               "title": "Trigger",
+      #               "value": "'"${{ github.event_name }}"'",
+      #               "short": true
+      #             },
+      #             {
+      #               "title": "Test Summary",
+      #               "value": "'"${{ steps.test_summary.outputs.summary }}"'",
+      #               "short": false
+      #             },
+      #             {
+      #               "title": "Commit",
+      #               "value": "<'"${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"'|'"$(echo ${{ github.sha }} | head -c 7)"'> - '"$COMMIT_MSG"'",
+      #               "short": false
+      #             },
+      #             {
+      #               "title": "View Run",
+      #               "value": "<'"$RUN_URL"'|GitHub Actions Run>",
+      #               "short": true
+      #             },
+      #             {
+      #               "title": "Download Reports",
+      #               "value": "<'"$ARTIFACT_URL"'|Artifacts & Reports>",
+      #               "short": true
+      #             }
+      #           ],
+      #           "footer": "GitHub Actions • Android Emulator Tests",
+      #           "ts": '"$(date +%s)"'
+      #         }
+      #       ]
+      #     }' \
+      #     "$SLACK_WEBHOOK_URL"
+
+      # - name: Comment on PR
+      #   if: always() && github.event_name == 'pull_request'
+      #   uses: actions/github-script@v7
+      #   with:
+      #     script: |
+      #       const summary = `${{ steps.test_summary.outputs.summary }}`;
+      #       const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+      #       const artifactUrl = `${runUrl}#artifacts`;
+            
+      #       const status = '${{ env.TEST_STATUS }}';
+      #       let emoji, statusText;
+            
+      #       switch(status) {
+      #         case 'PASSED':
+      #           emoji = '✅';
+      #           statusText = 'All Tests Passed';
+      #           break;
+      #         case 'MOSTLY_PASSED':
+      #           emoji = '⚠️';
+      #           statusText = `Mostly Passed (${{ env.FAILURE_PERCENTAGE }}% failed)`;
+      #           break;
+      #         case 'SOME_FAILED':
+      #           emoji = '🔶';
+      #           statusText = `Some Issues (${{ env.FAILURE_PERCENTAGE }}% failed)`;
+      #           break;
+      #         case 'MANY_FAILED':
+      #           emoji = '❌';
+      #           statusText = `Many Tests Failed (${{ env.FAILURE_PERCENTAGE }}% failed)`;
+      #           break;
+      #         default:
+      #           emoji = '⚠️';
+      #           statusText = 'No Results Found';
+      #       }
+            
+      #       const body = `## ${emoji} Android Emulator Tests Results
+            
+      #       **API Level:** ${{ matrix.api-level }}
+      #       **Status:** ${statusText}
+            
+      #       ### Test Summary
+      #       ${summary}
+            
+      #       ### Links
+      #       - [View Run](${runUrl})
+      #       - [Download Reports](${artifactUrl})
+            
+      #       > Automated comment from GitHub Actions`;
+            
+      #       github.rest.issues.createComment({
+      #         issue_number: context.issue.number,
+      #         owner: context.repo.owner,
+      #         repo: context.repo.repo,
+      #         body: body
+      #       });
