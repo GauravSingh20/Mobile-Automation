@@ -50,7 +50,7 @@ jobs:
       - name: Download APK from Google Drive folder
         run: |
           # Google Drive folder link containing InvoiceSimple.apk
-          GDRIVE_FOLDER_URL="https://drive.google.com/file/d/1XQWKi8p56IqCkDYy1kk2Q2qEd2D2_uB8/view?usp=drive_link"
+          GDRIVE_FOLDER_URL="https://drive.google.com/drive/folders/17KCGNGejjxYwPlYMa13Nq1-KjyceEv-g?usp=sharing"
           FOLDER_ID=$(echo $GDRIVE_FOLDER_URL | sed -n 's/.*\/folders\/\([^?]*\).*/\1/p')
           echo "Folder ID: $FOLDER_ID"
           
